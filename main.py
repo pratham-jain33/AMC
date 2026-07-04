@@ -90,6 +90,20 @@ def send_volume_down():
     except Exception:
         pass
 
+def send_next_track():
+    try:
+        ctypes.windll.user32.keybd_event(0xB0, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0xB0, 0, 2, 0)
+    except Exception:
+        pass
+
+def send_prev_track():
+    try:
+        ctypes.windll.user32.keybd_event(0xB1, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0xB1, 0, 2, 0)
+    except Exception:
+        pass
+
 # Initialize Mouse
 mouse = Controller()
 
@@ -127,6 +141,7 @@ volume_active = False
 prev_volume_y = None
 volume_accumulator = 0.0
 peace_counter = 0
+media_triggered = False
 
 def get_distance(p1, p2):
     return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
@@ -176,6 +191,7 @@ try:
             prev_volume_y = None
             volume_accumulator = 0.0
             peace_counter = 0
+            media_triggered = False
 
         was_hand_detected = current_hand_detected
         
@@ -261,6 +277,8 @@ try:
                 # --- GESTURE CLASSIFIER / PEACE SIGN DETECTION ---
                 index_up = get_distance(landmarks[0], landmarks[8]) > get_distance(landmarks[0], landmarks[6])
                 middle_up = get_distance(landmarks[0], landmarks[12]) > get_distance(landmarks[0], landmarks[10])
+                ring_up = get_distance(landmarks[0], landmarks[16]) > get_distance(landmarks[0], landmarks[14])
+                pinky_up = get_distance(landmarks[0], landmarks[20]) > get_distance(landmarks[0], landmarks[18])
                 ring_down = get_distance(landmarks[0], landmarks[16]) < get_distance(landmarks[0], landmarks[14])
                 pinky_down = get_distance(landmarks[0], landmarks[20]) < get_distance(landmarks[0], landmarks[18])
                 
@@ -273,6 +291,29 @@ try:
                     peace_counter = max(0, peace_counter - 1)
                 
                 is_peace = (peace_counter >= 3)
+                
+                # --- MEDIA GESTURE CLASSIFIER / FLAT HAND DETECTION ---
+                is_flat_hand = index_up and middle_up and ring_up and pinky_up and not is_pinching
+                
+                if is_flat_hand:
+                    dx = landmarks[9].x - landmarks[0].x
+                    dy = landmarks[9].y - landmarks[0].y
+                    angle = math.degrees(math.atan2(dy, dx))
+                    
+                    if angle > -55 and angle <= 0: # Right tilt
+                        if not media_triggered:
+                            send_next_track()
+                            media_triggered = True
+                            print("⏭️ Next Track")
+                    elif angle < -125 or angle > 0: # Left tilt
+                        if not media_triggered:
+                            send_prev_track()
+                            media_triggered = True
+                            print("⏮️ Previous Track")
+                    elif -105 < angle < -75: # Upright
+                        media_triggered = False
+                else:
+                    media_triggered = False
                 
                 # --- VOLUME FEATURE LOGIC ---
                 if is_peace:
