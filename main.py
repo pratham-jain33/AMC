@@ -37,13 +37,13 @@ from pynput import keyboard as kb
 # CONFIGURATION SETTINGS
 # =========================================================
 SHOW_UI = False         # Set to True to see the camera feed
-MOUSE_SPEED = 4.0       # Amplifies finger movement distance
+MOUSE_SPEED = 3.0       # Amplifies finger movement distance
 
 # ── Dynamic Smoothing (Velocity-Adaptive) ────────────────
 # At slow hand speed → SMOOTH_SLOW for pixel-perfect precision
 # At fast hand speed → SMOOTH_FAST for zero-lag snapping
-SMOOTH_SLOW = 2        # Higher = smoother at low speed
-SMOOTH_FAST = 5      # Lower = snappier at high speed
+SMOOTH_SLOW = 4        # Higher = smoother at low speed
+SMOOTH_FAST = 4      # Lower = snappier at high speed
 VELOCITY_THRESHOLD = 24   # px/frame speed that fully triggers fast mode
 
 # ── Dynamic Dead-Zone ────────────────────────────────────
