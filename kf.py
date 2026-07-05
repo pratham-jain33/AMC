@@ -1,6 +1,7 @@
 import cv2
 import sys
 import math
+import numpy as np
 
 # Configure UTF-8 output to prevent Windows console encoding crashes with emojis
 if sys.platform.startswith('win'):
@@ -39,12 +40,15 @@ from pynput import keyboard as kb
 SHOW_UI = False         # Set to True to see the camera feed
 MOUSE_SPEED = 4.0       # Amplifies finger movement distance
 
-# ── Dynamic Smoothing (Velocity-Adaptive) ────────────────
-# At slow hand speed → SMOOTH_SLOW for pixel-perfect precision
-# At fast hand speed → SMOOTH_FAST for zero-lag snapping
-SMOOTH_SLOW = 2        # Higher = smoother at low speed
-SMOOTH_FAST = 5      # Lower = snappier at high speed
-VELOCITY_THRESHOLD = 24   # px/frame speed that fully triggers fast mode
+# ── Kalman Filter Cursor ──────────────────────────────────
+# These replace the EMA smoothing constants from main.py.
+# Q_POS / Q_VEL: process noise — how much position/velocity can change per frame.
+# Higher Q_POS → trusts measurements more → lower lag, more jitter.
+# R_NOISE: measurement noise — how noisy MediaPipe landmarks are.
+# Higher R_NOISE → trusts prediction more → smoother, slightly more lag.
+KF_Q_POS  = 2.0    # position process noise  (tune down for smoother, up for snappier)
+KF_Q_VEL  = 25.0   # velocity process noise  (high = allows fast direction changes)
+KF_R_NOISE = 12.0  # measurement noise       (tune up if jitter is visible)
 
 # ── Dynamic Dead-Zone ────────────────────────────────────
 DEADZONE = 0.8           # Ignores sub-pixel tremors (px)
@@ -74,10 +78,10 @@ ZOOM_SENSITIVITY    = 50.0
 
 # ── Open Palm Rotation — Media Controls ───────────────────
 # All 5 fingers extended + wrist rotation fires next/prev track.
-#   Rotate right (clockwise)        → Next Track ⏭️
+#   Rotate right (clockwise)         → Next Track ⏭️
 #   Rotate left  (counter-clockwise) → Prev Track ⏮️
-ROTATION_THRESH       = 0.27   # radians (~26°) from baseline to trigger
-MEDIA_COOLDOWN_FRAMES = 60     # 3 s at ~30 fps cooldown between commands
+ROTATION_THRESH       = 0.45   # radians (~26°) from baseline to trigger
+MEDIA_COOLDOWN_FRAMES = 90     # 3 s at ~30 fps cooldown between commands
 
 # ── Navigation Mode (Fist ✊ gesture) ────────────────────
 # Normalized x-distance of fist movement per alt+tab step.
@@ -91,7 +95,76 @@ ON_SOUND  = "on.wav"
 OFF_SOUND = "off.wav"
 # =========================================================
 
-print("🚀 Initializing Multi-Finger Gesture Engine v2 (Earthquake-Proof Edition)...")
+print("🚀 [KF] Initializing Kalman-Filter Gesture Engine v2 ...")
+
+# =========================================================
+# KALMAN FILTER — 4-state cursor tracker [x, y, vx, vy]
+# =========================================================
+class KalmanCursor:
+    """
+    4-state Kalman filter: state = [x, y, vx, vy].
+
+    Because the filter models velocity, it can predict where the cursor
+    *will be* on the next frame and correct based on the measurement —
+    resulting in near-zero lag while still rejecting MediaPipe jitter.
+
+    Tuning guide:
+      KF_Q_VEL  ↑  → faster tracking, can follow sharp direction changes
+      KF_R_NOISE ↑ → smoother output, slightly more lag
+    """
+    def __init__(self, q_pos=KF_Q_POS, q_vel=KF_Q_VEL, r_noise=KF_R_NOISE):
+        # State transition: x' = Fx  (dt = 1 frame)
+        self.F = np.array([[1, 0, 1, 0],
+                           [0, 1, 0, 1],
+                           [0, 0, 1, 0],
+                           [0, 0, 0, 1]], dtype=float)
+
+        # Measurement: we observe x and y
+        self.H = np.array([[1, 0, 0, 0],
+                           [0, 1, 0, 0]], dtype=float)
+
+        # Process noise covariance
+        self.Q = np.diag([q_pos, q_pos, q_vel, q_vel])
+
+        # Measurement noise covariance
+        self.R = np.eye(2) * r_noise
+
+        # State vector and covariance matrix
+        self.x = np.zeros(4)
+        self.P = np.eye(4) * 1000.0   # large initial uncertainty
+
+        self.initialized = False
+
+    def reset(self):
+        """Call when tracking is lost so the filter restarts cleanly."""
+        self.initialized = False
+        self.x = np.zeros(4)
+        self.P = np.eye(4) * 1000.0
+
+    def update(self, mx: float, my: float):
+        """
+        Feed one measurement (raw landmark position in pixels) and return
+        the filtered (x, y) estimate.
+        """
+        if not self.initialized:
+            self.x = np.array([mx, my, 0.0, 0.0])
+            self.initialized = True
+            return mx, my
+
+        # ── Predict ────────────────────────────────────────────
+        x_pred = self.F @ self.x
+        P_pred = self.F @ self.P @ self.F.T + self.Q
+
+        # ── Update (Kalman gain) ───────────────────────────────
+        z = np.array([mx, my])
+        S = self.H @ P_pred @ self.H.T + self.R          # innovation covariance
+        K = P_pred @ self.H.T @ np.linalg.inv(S)         # Kalman gain
+
+        self.x = x_pred + K @ (z - self.H @ x_pred)
+        self.P = (np.eye(4) - K @ self.H) @ P_pred
+
+        return float(self.x[0]), float(self.x[1])
+
 
 def play_sound(sound_file):
     if os.path.exists(sound_file):
@@ -137,8 +210,6 @@ def send_play_pause():
     except Exception:
         pass
 
-
-
 # Initialize Mouse
 mouse = Controller()
 
@@ -162,8 +233,10 @@ left_clicked  = False
 right_clicked = False
 scrolling     = False
 
-smooth_x, smooth_y = None, None
-prev_smooth_x, prev_smooth_y = None, None  # for velocity calculation
+# KF-based cursor state (replaces EMA smooth_x/y + prev_smooth_x/y)
+kf = KalmanCursor()
+smooth_x, smooth_y = None, None   # last KF output position
+
 prev_scroll_y = None
 was_hand_detected = False
 
@@ -236,7 +309,7 @@ def is_finger_up(lm, tip_id, pip_id):
     """True if fingertip is further from wrist than its PIP joint."""
     return get_distance(lm[0], lm[tip_id]) > get_distance(lm[0], lm[pip_id])
 
-print("\n🚀 Camera Online. System tracking live. Press 'q' to quit.")
+print("\n🚀 [KF] Camera Online. System tracking live. Press 'q' to quit.")
 
 try:
     while cap.isOpened():
@@ -254,19 +327,21 @@ try:
         if current_hand_detected and not was_hand_detected:
             print("👋 Hand Detected! Activating in 0.5s...")
             play_sound(ON_SOUND)
-            time.sleep(0.05)
+            time.sleep(0.5)
+            kf.reset()
             smooth_x, smooth_y = None, None
-            prev_smooth_x, prev_smooth_y = None, None
             prev_scroll_y = None
             prev_volume_y = None
+            rotation_base_angle = None
+            media_cooldown      = 0
             reset_all_gestures()
 
         # --- STATE TRANSITION: HAND LOST (ON → OFF) ---
         if not current_hand_detected and was_hand_detected:
             print("📴 Hand Lost.")
             play_sound(OFF_SOUND)
+            kf.reset()
             smooth_x, smooth_y = None, None
-            prev_smooth_x, prev_smooth_y = None, None
             prev_scroll_y = None
             if left_clicked:
                 mouse.release(Button.left)
@@ -287,7 +362,7 @@ try:
                     pass
             nav_mode_active    = False
             nav_alt_held       = False
-            nav_tab_accum      = 0.0
+            nav_tab_accum    = 0.0
             prev_nav_x         = None
             nav_tab_cooldown   = 0
             reset_all_gestures()
@@ -394,7 +469,7 @@ try:
                 # ✊ fist-with-thumb-out: 4 fingers curled, thumb extended
                 raw_fist  = (thumb_up and not index_up and not middle_up
                              and not ring_up and not pinky_up and not any_pinching)
-                # 🖐️ open palm: all 5 fingers extended (used for rotation media control)
+                # 🖐️ open palm: all 5 fingers extended (rotation media control)
                 all_fingers_up = (thumb_up and index_up and middle_up
                                   and ring_up and pinky_up and not any_pinching)
                 raw_pinch_l = left_ratio   < LEFT_CLICK_START
@@ -427,7 +502,6 @@ try:
                         rotation_base_angle = cur_angle
                     else:
                         delta = cur_angle - rotation_base_angle
-                        # Normalise to (−π, +π] to handle wrap-around
                         if delta > math.pi:
                             delta -= 2 * math.pi
                         elif delta < -math.pi:
@@ -444,7 +518,7 @@ try:
                             media_cooldown      = MEDIA_COOLDOWN_FRAMES
                             rotation_base_angle = None
                 else:
-                    rotation_base_angle = None  # reset baseline when hand leaves pose
+                    rotation_base_angle = None
 
                 if media_cooldown > 0:
                     media_cooldown -= 1
@@ -514,7 +588,6 @@ try:
                             nav_alt_held = False
                         print("✊ Navigation Mode OFF — window selected")
 
-
                 # ── VOLUME CONTROL: PEACE SIGN ────────────────────────
                 if is_peace:
                     if not volume_active:
@@ -557,44 +630,26 @@ try:
                         scrolling = False
                         prev_scroll_y = None
 
-                # ── UPGRADE 3: VELOCITY-ADAPTIVE CURSOR MOVEMENT ──────
-                # Cursor moves only when right-click is open, not scrolling,
-                # and not in volume mode.
+                # ── KALMAN FILTER CURSOR MOVEMENT ─────────────────────
+                # Replaces the EMA (velocity-adaptive) cursor from main.py.
+                # The KF predicts position one frame ahead and corrects from
+                # the measurement, giving near-zero lag without EMA delay.
+                # Cursor disabled during nav mode.
                 if pinch_r_released and not scrolling and not volume_active and not nav_mode_active:
-                    if smooth_x is None or smooth_y is None:
-                        smooth_x, smooth_y = cx, cy
-                        prev_smooth_x, prev_smooth_y = cx, cy
-                    else:
-                        # Calculate raw hand velocity in screen pixels/frame
-                        if prev_smooth_x is not None:
-                            vel = math.sqrt(
-                                (cx - prev_smooth_x)**2 +
-                                (cy - prev_smooth_y)**2
-                            )
-                        else:
-                            vel = 0.0
+                    filtered_x, filtered_y = kf.update(cx, cy)
 
-                        # Linearly interpolate smoothing factor:
-                        # Slow hand → max smoothing (sniper precision)
-                        # Fast hand → min smoothing (instant snap)
-                        t = min(1.0, vel / VELOCITY_THRESHOLD)
-                        dynamic_smooth = SMOOTH_SLOW + t * (SMOOTH_FAST - SMOOTH_SLOW)
-
-                        next_smooth_x = smooth_x + (cx - smooth_x) / dynamic_smooth
-                        next_smooth_y = smooth_y + (cy - smooth_y) / dynamic_smooth
-
-                        dx = (next_smooth_x - smooth_x) * MOUSE_SPEED
-                        dy = (next_smooth_y - smooth_y) * MOUSE_SPEED
-
+                    if smooth_x is not None:
+                        dx = (filtered_x - smooth_x) * MOUSE_SPEED
+                        dy = (filtered_y - smooth_y) * MOUSE_SPEED
                         if abs(dx) > DEADZONE or abs(dy) > DEADZONE:
                             curr_mx, curr_my = mouse.position
                             mouse.position = (int(curr_mx + dx), int(curr_my + dy))
 
-                        prev_smooth_x, prev_smooth_y = smooth_x, smooth_y
-                        smooth_x, smooth_y = next_smooth_x, next_smooth_y
+                    smooth_x, smooth_y = filtered_x, filtered_y
                 else:
+                    if smooth_x is not None:
+                        kf.reset()
                     smooth_x, smooth_y = None, None
-                    prev_smooth_x, prev_smooth_y = None, None
 
                 # ── LEFT CLICK / DRAG ─────────────────────────────────
                 if is_pinch_l and not volume_active and not nav_mode_active:
@@ -620,13 +675,13 @@ try:
 
                 # ── UI DEBUG OVERLAY ──────────────────────────────────
                 if SHOW_UI:
-                    mode = "CURSOR"
-                    if nav_mode_active:   mode = "NAV"
+                    mode = "CURSOR (KF)"
+                    if nav_mode_active:     mode = "NAV"
                     elif media_cooldown > 0: mode = "MEDIA-CD"
-                    elif volume_active:   mode = "VOLUME"
-                    elif scrolling:       mode = "SCROLL"
-                    elif left_clicked:    mode = "L-DRAG"
-                    elif right_clicked:   mode = "R-CLICK"
+                    elif volume_active:     mode = "VOLUME"
+                    elif scrolling:         mode = "SCROLL"
+                    elif left_clicked:      mode = "L-DRAG"
+                    elif right_clicked:     mode = "R-CLICK"
                     cv2.putText(frame, f"MODE: {mode}  scale={hand_scale:.3f}", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 230, 120), 2)
                     cv2.putText(frame, f"L={left_ratio:.2f} R={right_ratio:.2f} M={scroll_ratio:.2f}", (10, 58),
@@ -642,7 +697,7 @@ try:
             elif volume_active:
                 cv2.putText(frame, "VOLUME ACTIVE", (10, 86),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2)
-            cv2.imshow('Gesture Mouse v2 — Debug Panel', frame)
+            cv2.imshow('Gesture Mouse KF — Debug Panel', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
         else:
@@ -654,4 +709,4 @@ except KeyboardInterrupt:
 finally:
     cap.release()
     cv2.destroyAllWindows()
-    print("👋 System offline.")
+    print("👋 [KF] System offline.")
