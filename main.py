@@ -43,7 +43,7 @@ MOUSE_SPEED = 3.0       # Amplifies finger movement distance
 # At slow hand speed → SMOOTH_SLOW for pixel-perfect precision
 # At fast hand speed → SMOOTH_FAST for zero-lag snapping
 SMOOTH_SLOW = 4        # Higher = smoother at low speed
-SMOOTH_FAST = 4      # Lower = snappier at high speed
+SMOOTH_FAST = 2.5      # Lower = snappier at high speed
 VELOCITY_THRESHOLD = 24   # px/frame speed that fully triggers fast mode
 
 # ── Dynamic Dead-Zone ────────────────────────────────────
@@ -76,16 +76,16 @@ ZOOM_SENSITIVITY    = 50.0
 # All 5 fingers extended + wrist rotation fires next/prev track.
 #   Rotate right (clockwise)        → Next Track ⏭️
 #   Rotate left  (counter-clockwise) → Prev Track ⏮️
-ROTATION_THRESH       = 0.27   # radians (~26°) from baseline to trigger
+ROTATION_THRESH       = 0.34   # radians (~26°) from baseline to trigger
 MEDIA_COOLDOWN_FRAMES = 60     # 3 s at ~30 fps cooldown between commands
 
 # ── Navigation Mode (Fist ✊ gesture) ────────────────────
 # Normalized x-distance of fist movement per alt+tab step.
-NAV_TAB_SENSITIVITY = 0.08   # in [0..1] units (normalized hand x)
+NAV_TAB_SENSITIVITY = 0.05   # in [0..1] units (normalized hand x)
 NAV_TAB_COOLDOWN    = 7      # min frames between tab presses (debounce)
 
 # Audio Assets
-LEFT_CLICK_SOUND  = "left_click2.wav"
+LEFT_CLICK_SOUND  = "left_click.wav"
 RIGHT_CLICK_SOUND = "right_click.wav"
 ON_SOUND  = "on.wav"
 OFF_SOUND = "off.wav"
