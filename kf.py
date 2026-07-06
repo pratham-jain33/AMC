@@ -93,6 +93,16 @@ LEFT_CLICK_SOUND  = "left_click2.wav"
 RIGHT_CLICK_SOUND = "right_click.wav"
 ON_SOUND  = "on.wav"
 OFF_SOUND = "off.wav"
+
+# ── Performance Settings ─────────────────────────────────
+TARGET_FPS       = 15          # Cap the main loop to this many frames per second
+FRAME_INTERVAL   = 1.0 / TARGET_FPS   # seconds per frame (~67 ms)
+# Reduced resolution: 320x240 is 1/4 the pixels of 640x480, dramatically
+# cutting MediaPipe's per-frame cost. Gesture ratios are normalized so
+# accuracy is unaffected.
+FRAME_W, FRAME_H = 320, 240
+# Idle frame-skip: when no hand is visible, process only 1 in N frames
+IDLE_SKIP_FRAMES = 3
 # =========================================================
 
 print("🚀 [KF] Initializing Kalman-Filter Gesture Engine v2 ...")
@@ -217,16 +227,18 @@ mouse = Controller()
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 hands = mp_hands.Hands(
+    model_complexity=0,           # 0 = lite model (~40% cheaper than default)
     max_num_hands=2,
-    min_detection_confidence=0.85,
-    min_tracking_confidence=0.85
+    min_detection_confidence=0.80,
+    min_tracking_confidence=0.80
 )
 
-# Camera Setup
-FRAME_W, FRAME_H = 640, 480
+# Camera Setup — 320×240 (¼ the pixels of 640×480, cuts MediaPipe cost dramatically)
 cap = cv2.VideoCapture(0)
-cap.set(3, FRAME_W)
-cap.set(4, FRAME_H)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+cap.set(cv2.CAP_PROP_FPS,          TARGET_FPS)   # Ask driver to cap frame delivery
+cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)            # Minimize capture buffer lag
 
 # ─── Tracking & State Variables ─────────────────────────
 left_clicked  = False
@@ -311,15 +323,42 @@ def is_finger_up(lm, tip_id, pip_id):
 
 print("\n🚀 [KF] Camera Online. System tracking live. Press 'q' to quit.")
 
+# ─── Performance counters ────────────────────────────────
+_idle_counter  = 0      # counts frames while no hand, used for idle skip
+_last_frame_t  = None   # wall-clock time of the last loop start
+
 try:
     while cap.isOpened():
+        # ── FPS CAP: sleep for the remainder of the frame interval ──────
+        now = time.monotonic()
+        if _last_frame_t is not None:
+            elapsed = now - _last_frame_t
+            remaining = FRAME_INTERVAL - elapsed
+            if remaining > 0.001:
+                time.sleep(remaining)
+        _last_frame_t = time.monotonic()
+
         success, frame = cap.read()
         if not success:
             break
 
+        # ── IDLE FRAME SKIP: when no hand, process only every Nth frame ─
+        if not was_hand_detected:
+            _idle_counter += 1
+            if _idle_counter % IDLE_SKIP_FRAMES != 0:
+                continue   # skip full MediaPipe processing this frame
+
+        # ── Always flip horizontally ────────────────────────────────────
+        # IMPORTANT: flip must happen BEFORE MediaPipe so landmark x-coords
+        # match screen direction. Without flip, moving hand right makes
+        # cursor go left (raw camera x is mirrored vs screen x).
         frame = cv2.flip(frame, 1)
+
+        # ── OPTIMIZATION: mark frame non-writeable → MediaPipe skips copy ─
+        frame.flags.writeable = False
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb_frame)
+        frame.flags.writeable = True   # restore for drawing if SHOW_UI
 
         current_hand_detected = bool(results.multi_hand_landmarks)
 
@@ -698,10 +737,9 @@ try:
                 cv2.putText(frame, "VOLUME ACTIVE", (10, 86),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2)
             cv2.imshow('Gesture Mouse KF — Debug Panel', frame)
+            # waitKey handles display refresh; remaining sleep already done above
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-        else:
-            cv2.waitKey(1)
 
 except KeyboardInterrupt:
     print("\nProcess interrupted cleanly.")

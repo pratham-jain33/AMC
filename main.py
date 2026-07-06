@@ -32,19 +32,34 @@ warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf'
 import mediapipe as mp
 from pynput.mouse import Controller, Button
 from pynput import keyboard as kb
+import tkinter as tk
 
 # =========================================================
 # CONFIGURATION SETTINGS
 # =========================================================
 SHOW_UI = False         # Set to True to see the camera feed
-MOUSE_SPEED = 3.0       # Amplifies finger movement distance
+MOUSE_SPEED = 5.0       # Amplifies finger movement distance
+
+# ── Floating Status Dot UI ───────────────────────────────
+ENABLE_DOT_UI = False         # Set to True to show the floating status dot on screen
+DOT_SIZE = 16                # Diameter of the dot in pixels
+# Position: "bottom-right", "bottom-left", "top-right", "top-left", or custom (x, y) tuple e.g. (1800, 1000)
+DOT_POSITION = "bottom-right"
+DOT_MARGIN_X = 40            # Margin from left/right edge of screen (in pixels)
+DOT_MARGIN_Y = 40            # Margin from top/bottom edge of screen (in pixels)
+
+# Status Colors (Hex format or Tkinter color names)
+# Format: (Center color, Outer border color)
+DOT_COLOR_HAND_DETECTED = ("#00FF00", "#A5D6A7")  # Green center, light green outer ring
+DOT_COLOR_MEDIA_NAV     = ("#FFFF00", "#FFF59D")  # Yellow center, light yellow outer ring
+DOT_COLOR_NO_HAND       = ("#FF0000", "#EF9A9A")  # Red center, light pink/red outer ring
 
 # ── Dynamic Smoothing (Velocity-Adaptive) ────────────────
 # At slow hand speed → SMOOTH_SLOW for pixel-perfect precision
 # At fast hand speed → SMOOTH_FAST for zero-lag snapping
-SMOOTH_SLOW = 4        # Higher = smoother at low speed
-SMOOTH_FAST = 2.5      # Lower = snappier at high speed
-VELOCITY_THRESHOLD = 24   # px/frame speed that fully triggers fast mode
+SMOOTH_SLOW = 6        # Higher = smoother at low speed
+SMOOTH_FAST = 2      # Lower = snappier at high speed
+VELOCITY_THRESHOLD = 16   # px/frame speed that fully triggers fast mode
 
 # ── Dynamic Dead-Zone ────────────────────────────────────
 DEADZONE = 0.8           # Ignores sub-pixel tremors (px)
@@ -89,6 +104,18 @@ LEFT_CLICK_SOUND  = "left_click.wav"
 RIGHT_CLICK_SOUND = "right_click.wav"
 ON_SOUND  = "on.wav"
 OFF_SOUND = "off.wav"
+
+# ── Performance Settings ─────────────────────────────────
+TARGET_FPS       = 25          # Cap the main loop to this many frames per second
+FRAME_INTERVAL   = 1.0 / TARGET_FPS   # seconds per frame (~67 ms)
+# Reduced resolution: 320x240 is 1/4 the pixels of 640x480, dramatically
+# cutting MediaPipe's per-frame cost. Gesture ratios are normalized so
+# accuracy is unaffected.
+FRAME_W, FRAME_H = 320, 240
+# Tkinter dot UI update throttle: update every N main-loop frames (saves CPU)
+DOT_UPDATE_INTERVAL = 3
+# Idle frame-skip: when no hand is visible, process only 1 in N frames
+IDLE_SKIP_FRAMES = 3
 # =========================================================
 
 print("🚀 Initializing Multi-Finger Gesture Engine v2 (Earthquake-Proof Edition)...")
@@ -138,6 +165,88 @@ def send_play_pause():
         pass
 
 
+# =========================================================
+# FLOATING STATUS DOT UI (Transparent & Windowless)
+# =========================================================
+class FloatingDotUI:
+    def __init__(self):
+        if not ENABLE_DOT_UI:
+            return
+        self.root = tk.Tk()
+        self.root.overrideredirect(True)
+        self.root.wm_attributes("-topmost", True)
+        self.root.wm_attributes("-transparentcolor", "black")
+        self.root.config(bg="black")
+        
+        # Calculate position
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        
+        if isinstance(DOT_POSITION, (tuple, list)) and len(DOT_POSITION) == 2:
+            x, y = DOT_POSITION
+        elif DOT_POSITION == "bottom-right":
+            x = screen_w - DOT_SIZE - DOT_MARGIN_X
+            y = screen_h - DOT_SIZE - DOT_MARGIN_Y
+        elif DOT_POSITION == "bottom-left":
+            x = DOT_MARGIN_X
+            y = screen_h - DOT_SIZE - DOT_MARGIN_Y
+        elif DOT_POSITION == "top-right":
+            x = screen_w - DOT_SIZE - DOT_MARGIN_X
+            y = DOT_MARGIN_Y
+        elif DOT_POSITION == "top-left":
+            x = DOT_MARGIN_X
+            y = DOT_MARGIN_Y
+        else:
+            x = screen_w - DOT_SIZE - DOT_MARGIN_X
+            y = screen_h - DOT_SIZE - DOT_MARGIN_Y
+            
+        self.root.geometry(f"{DOT_SIZE}x{DOT_SIZE}+{int(x)}+{int(y)}")
+        
+        self.canvas = tk.Canvas(self.root, width=DOT_SIZE, height=DOT_SIZE, bg="black", highlightthickness=0, bd=0)
+        self.canvas.pack()
+        
+        self.outer_id = self.canvas.create_oval(1, 1, DOT_SIZE - 1, DOT_SIZE - 1, fill=DOT_COLOR_NO_HAND[1], outline="")
+        
+        # Inner circle (centered, around 60% of dot size)
+        inner_r = max(4, int(DOT_SIZE * 0.6))
+        offset = (DOT_SIZE - inner_r) // 2
+        self.inner_id = self.canvas.create_oval(offset, offset, offset + inner_r, offset + inner_r, fill=DOT_COLOR_NO_HAND[0], outline="")
+        self.current_color = DOT_COLOR_NO_HAND
+        
+        self.root.update()
+
+    def set_status(self, status):
+        """status: 'no_hand', 'hand_detected', 'media_nav'"""
+        if not ENABLE_DOT_UI or not hasattr(self, 'root'):
+            return
+        if status == 'no_hand':
+            colors = DOT_COLOR_NO_HAND
+        elif status == 'media_nav':
+            colors = DOT_COLOR_MEDIA_NAV
+        else:
+            colors = DOT_COLOR_HAND_DETECTED
+            
+        if colors != self.current_color:
+            self.canvas.itemconfig(self.outer_id, fill=colors[1])
+            self.canvas.itemconfig(self.inner_id, fill=colors[0])
+            self.current_color = colors
+            
+    def update(self):
+        if not ENABLE_DOT_UI or not hasattr(self, 'root'):
+            return
+        try:
+            self.root.update()
+        except Exception:
+            pass
+            
+    def close(self):
+        if not ENABLE_DOT_UI or not hasattr(self, 'root'):
+            return
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
 
 # Initialize Mouse
 mouse = Controller()
@@ -146,16 +255,18 @@ mouse = Controller()
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 hands = mp_hands.Hands(
+    model_complexity=0,           # 0 = lite model (~40% cheaper than default)
     max_num_hands=2,
-    min_detection_confidence=0.85,
-    min_tracking_confidence=0.85
+    min_detection_confidence=0.80,
+    min_tracking_confidence=0.80
 )
 
-# Camera Setup
-FRAME_W, FRAME_H = 640, 480
+# Camera Setup — 320×240 (¼ the pixels of 640×480, cuts MediaPipe cost dramatically)
 cap = cv2.VideoCapture(0)
-cap.set(3, FRAME_W)
-cap.set(4, FRAME_H)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+cap.set(cv2.CAP_PROP_FPS,          TARGET_FPS)   # Ask driver to cap frame delivery
+cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)            # Minimize capture buffer lag
 
 # ─── Tracking & State Variables ─────────────────────────
 left_clicked  = False
@@ -236,17 +347,48 @@ def is_finger_up(lm, tip_id, pip_id):
     """True if fingertip is further from wrist than its PIP joint."""
     return get_distance(lm[0], lm[tip_id]) > get_distance(lm[0], lm[pip_id])
 
+dot_ui = None
 print("\n🚀 Camera Online. System tracking live. Press 'q' to quit.")
 
+# ─── Performance counters ────────────────────────────────
+_frame_count    = 0      # total frames processed
+_idle_counter   = 0      # counts frames while no hand, used for idle skip
+_dot_counter    = 0      # counts frames for Tkinter throttle
+_last_frame_t   = None   # wall-clock time of the last loop start
+
 try:
+    dot_ui = FloatingDotUI()
     while cap.isOpened():
+        # ── FPS CAP: sleep for the remainder of the frame interval ──────
+        now = time.monotonic()
+        if _last_frame_t is not None:
+            elapsed = now - _last_frame_t
+            remaining = FRAME_INTERVAL - elapsed
+            if remaining > 0.001:
+                time.sleep(remaining)
+        _last_frame_t = time.monotonic()
+
         success, frame = cap.read()
         if not success:
             break
 
+        # ── IDLE FRAME SKIP: when no hand, process only every Nth frame ─
+        if not was_hand_detected:
+            _idle_counter += 1
+            if _idle_counter % IDLE_SKIP_FRAMES != 0:
+                continue   # skip full MediaPipe processing this frame
+
+        # ── Always flip horizontally ────────────────────────────────────
+        # IMPORTANT: flip must happen BEFORE MediaPipe so landmark x-coords
+        # match screen direction. Without flip, moving hand right makes
+        # cursor go left (raw camera x is mirrored vs screen x).
         frame = cv2.flip(frame, 1)
+
+        # ── OPTIMIZATION: mark frame non-writeable → MediaPipe skips copy ─
+        frame.flags.writeable = False
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb_frame)
+        frame.flags.writeable = True   # restore for drawing if SHOW_UI
 
         current_hand_detected = bool(results.multi_hand_landmarks)
 
@@ -632,6 +774,20 @@ try:
                     cv2.putText(frame, f"L={left_ratio:.2f} R={right_ratio:.2f} M={scroll_ratio:.2f}", (10, 58),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 0), 1)
 
+        # ── UPDATE FLOATING STATUS DOT (throttled) ────────────
+        _dot_counter += 1
+        if dot_ui:
+            # Always keep status current; only call update() every N frames
+            if current_hand_detected:
+                if nav_mode_active or volume_active or (media_cooldown > 0):
+                    dot_ui.set_status('media_nav')
+                else:
+                    dot_ui.set_status('hand_detected')
+            else:
+                dot_ui.set_status('no_hand')
+            if _dot_counter % DOT_UPDATE_INTERVAL == 0:
+                dot_ui.update()
+
         if SHOW_UI:
             if nav_mode_active:
                 cv2.putText(frame, "NAV MODE  fist right=Next  left=Prev  open fist=Confirm", (10, 86),
@@ -643,15 +799,16 @@ try:
                 cv2.putText(frame, "VOLUME ACTIVE", (10, 86),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2)
             cv2.imshow('Gesture Mouse v2 — Debug Panel', frame)
+            # waitKey handles display refresh; remaining sleep already done above
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-        else:
-            cv2.waitKey(1)
 
 except KeyboardInterrupt:
     print("\nProcess interrupted cleanly.")
 
 finally:
+    if dot_ui:
+        dot_ui.close()
     cap.release()
     cv2.destroyAllWindows()
     print("👋 System offline.")
