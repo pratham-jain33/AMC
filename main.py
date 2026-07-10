@@ -38,7 +38,7 @@ import tkinter as tk
 # CONFIGURATION SETTINGS
 # =========================================================
 SHOW_UI = False         # Set to True to see the camera feed
-MOUSE_SPEED = 5.0       # Amplifies finger movement distance
+MOUSE_SPEED = 5.5       # Amplifies finger movement distance
 
 # ── Floating Status Dot UI ───────────────────────────────
 ENABLE_DOT_UI = False         # Set to True to show the floating status dot on screen
